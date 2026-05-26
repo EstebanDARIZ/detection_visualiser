@@ -36,8 +36,6 @@ if errorlevel 1 (
 echo.
 echo ================================================
 echo   Installation terminee avec succes !
-echo   Pour lancer : glissez un fichier CSV sur
-echo   launch.bat
 echo ================================================
 echo.
 pause

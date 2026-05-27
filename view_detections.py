@@ -2,6 +2,7 @@
 # Usage : python view_detections.py detections.csv [--video /chemin/video.mp4]
 
 import argparse
+import bisect
 import os.path as osp
 import tkinter as tk
 from tkinter import messagebox
@@ -55,7 +56,7 @@ def parse_args():
 def read_csv(csv_path):
     """Retourne (video_path, detections_by_class).
 
-    detections_by_class : {class_id (int): set of frame_idx (int)}
+    detections_by_class : {class_id (int): {frame_idx (int): max_score (float)}}
     """
     video_path = None
     detections_by_class = {}
@@ -75,7 +76,12 @@ def read_csv(csv_path):
                 class_id  = int(row[2])
             except ValueError:
                 continue
-            detections_by_class.setdefault(class_id, set()).add(frame_idx)
+            try:
+                score = float(row[4]) if len(row) > 4 else 1.0
+            except ValueError:
+                score = 1.0
+            frames = detections_by_class.setdefault(class_id, {})
+            frames[frame_idx] = max(frames.get(frame_idx, 0.0), score)
 
     return video_path, detections_by_class
 
@@ -109,9 +115,11 @@ class DetectionSlider(tk.Canvas):
     def detected_frames(self):
         return self._detected_frames
 
-    def update_visibility(self, visible_classes):
-        self.visible_classes  = set(visible_classes)
-        self._detected_frames = frames_union(self.detections_by_class, visible_classes)
+    def set_detections(self, detections_by_class):
+        """Remplace les détections (déjà filtrées) et redessine."""
+        self.detections_by_class = detections_by_class
+        self.visible_classes     = set(detections_by_class.keys())
+        self._detected_frames    = frames_union(detections_by_class, self.visible_classes)
         self._redraw()
 
     def set_frame(self, frame_idx):
@@ -180,10 +188,13 @@ class VideoPlayer:
             root.destroy()
             return
 
-        self.fps           = self.cap.get(cv2.CAP_PROP_FPS) or 25
-        self.total_frames  = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.frame_delay   = int(1000 / self.fps)
-        self.current_frame = 0
+        self.fps              = self.cap.get(cv2.CAP_PROP_FPS) or 25
+        self.total_frames     = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.frame_delay      = int(1000 / self.fps)
+        self.current_frame    = 0
+        self._conf_threshold  = 0.0
+        self._nav_lock        = False  # empêche les navigations imbriquées
+        self._updating        = False  # empêche root.update() récursif
 
         self._build_ui(video_path)
         root.after(50, lambda: self._seek(0))
@@ -193,6 +204,11 @@ class VideoPlayer:
         root.bind('<Right>',  lambda e: self._seek(min(self.total_frames - 1, self.current_frame + 1)))
         root.bind('<Prior>',  lambda e: self._prev_detection())
         root.bind('<Next>',   lambda e: self._next_detection())
+        root.bind('a',        lambda e: self._prev_detection(1)  if not self._is_typing() else None)
+        root.bind('e',        lambda e: self._next_detection(1)  if not self._is_typing() else None)
+        root.bind('q',        lambda e: self._prev_detection(10) if not self._is_typing() else None)
+        root.bind('d',        lambda e: self._next_detection(10) if not self._is_typing() else None)
+        root.bind('<Escape>', lambda e: self._on_close())
         root.protocol('WM_DELETE_WINDOW', self._on_close)
 
     # ------------------------------------------------------------------
@@ -218,9 +234,10 @@ class VideoPlayer:
         self.canvas_video.bind('<Configure>', self._on_video_resize)
 
         # --- Slider (row 1) ---
+        filtered = self._filtered_detections()
         self.slider = DetectionSlider(
-            self.root, self.total_frames, self.detections_by_class,
-            self._visible_set(), on_seek=self._seek_and_pause)
+            self.root, self.total_frames, filtered,
+            set(filtered.keys()), on_seek=self._seek_and_pause)
         self.slider.grid(row=1, column=0, sticky='ew', padx=8, pady=(0, 4))
 
         # --- Barre de contrôles (row 2) ---
@@ -258,6 +275,28 @@ class VideoPlayer:
         tk.Label(panel, text='Classes :', bg='#1a1a1a', fg='#aaa',
                  font=('Helvetica', 10)).pack(side=tk.LEFT, padx=(0, 6))
 
+        # Slider de confiance (côté droit)
+        self.var_conf = tk.StringVar(value='0.00')
+        self.entry_conf = tk.Entry(panel, textvariable=self.var_conf, width=5,
+                                    bg='#222', fg='white', insertbackground='white',
+                                    font=('Courier', 10), justify='center',
+                                    relief=tk.FLAT, bd=1)
+        self.entry_conf.pack(side=tk.RIGHT, padx=(0, 4))
+        self.entry_conf.bind('<Return>',   self._on_conf_entry)
+        self.entry_conf.bind('<FocusOut>', self._on_conf_entry)
+
+        self.scale_conf = tk.Scale(
+            panel, from_=0.0, to=1.0, resolution=0.01,
+            orient=tk.HORIZONTAL, length=160,
+            bg='#1a1a1a', fg='white', highlightthickness=0,
+            troughcolor='#444', activebackground='#666',
+            showvalue=False, command=self._on_conf_change)
+        self.scale_conf.set(0.0)
+        self.scale_conf.pack(side=tk.RIGHT, padx=(4, 0))
+
+        tk.Label(panel, text='Confiance ≥', bg='#1a1a1a', fg='#aaa',
+                 font=('Helvetica', 10)).pack(side=tk.RIGHT, padx=(12, 4))
+
         self._class_buttons = {}
         # N'affiche que les classes présentes dans le CSV
         for cls_id in sorted(self.detections_by_class.keys()):
@@ -286,32 +325,70 @@ class VideoPlayer:
         btn   = self._class_buttons[cls_id]
         btn.config(bg=color, fg=fg, activebackground=color, activeforeground=fg)
 
-        self.slider.update_visibility(self._visible_set())
+        self._refresh_slider()
+
+    def _filtered_detections(self):
+        """Retourne {class_id: set(frame_idx)} selon visibilité et seuil de confiance."""
+        result = {}
+        for cls_id, frames_scores in self.detections_by_class.items():
+            if self._class_visible.get(cls_id, True):
+                filtered = {f for f, s in frames_scores.items() if s >= self._conf_threshold}
+                if filtered:
+                    result[cls_id] = filtered
+        return result
+
+    def _refresh_slider(self):
+        self.slider.set_detections(self._filtered_detections())
         self.lbl_det.config(text=f'{len(self.slider.detected_frames)} détection(s)')
+
+    def _on_conf_change(self, value):
+        self._conf_threshold = float(value)
+        self.var_conf.set(f'{self._conf_threshold:.2f}')
+        self._refresh_slider()
+
+    def _on_conf_entry(self, event=None):
+        try:
+            val = max(0.0, min(1.0, float(self.var_conf.get())))
+        except ValueError:
+            val = self._conf_threshold
+        self._conf_threshold = val
+        self.var_conf.set(f'{val:.2f}')
+        self.scale_conf.set(val)
+        self._refresh_slider()
+        self.root.focus_set()  # rend le focus à la fenêtre pour que les touches marchent
+
+    def _is_typing(self):
+        return isinstance(self.root.focus_get(), tk.Entry)
 
     # ------------------------------------------------------------------
     # Navigation entre détections
     # ------------------------------------------------------------------
 
-    def _next_detection(self):
+    def _next_detection(self, step=1):
+        if self._nav_lock:
+            return
         detected = self.slider.detected_frames
         if not detected:
             return
-        for f in detected:
-            if f > self.current_frame:
-                self._seek_and_pause(f)
-                return
-        self._seek_and_pause(detected[0])
+        self._nav_lock = True
+        try:
+            i = bisect.bisect_right(detected, self.current_frame)
+            self._seek_and_pause(detected[(i + step - 1) % len(detected)])
+        finally:
+            self._nav_lock = False
 
-    def _prev_detection(self):
+    def _prev_detection(self, step=1):
+        if self._nav_lock:
+            return
         detected = self.slider.detected_frames
         if not detected:
             return
-        for f in reversed(detected):
-            if f < self.current_frame:
-                self._seek_and_pause(f)
-                return
-        self._seek_and_pause(detected[-1])
+        self._nav_lock = True
+        try:
+            i = bisect.bisect_left(detected, self.current_frame)
+            self._seek_and_pause(detected[(i - step) % len(detected)])
+        finally:
+            self._nav_lock = False
 
     # ------------------------------------------------------------------
     # Lecture / seek
@@ -321,6 +398,13 @@ class VideoPlayer:
         self._stop_playback()
         self.btn_play.config(text='▶')
         self._seek(frame_idx)
+        # Vide la queue d'événements : traite les KeyRelease/Press accumulés
+        # pendant le seek pour éviter que la navigation continue après relâchement.
+        # _updating empêche la récursion si un autre seek est déclenché par update().
+        if not self._updating:
+            self._updating = True
+            self.root.update()
+            self._updating = False
 
     def _seek(self, frame_idx):
         self.current_frame = frame_idx
@@ -417,7 +501,7 @@ def main():
 
     initial_classes = set(args.classes) if args.classes else None
 
-    total_frames_det = sum(len(v) for v in detections_by_class.values())
+    total_frames_det = sum(len(v) for v in detections_by_class.values())  # nb frames par classe (peut se chevaucher)
     print(f"[INFO] Vidéo      : {video_path}")
     print(f"[INFO] Classes    : {sorted(detections_by_class.keys())}")
     print(f"[INFO] Détections : {total_frames_det} entrée(s) au total")
